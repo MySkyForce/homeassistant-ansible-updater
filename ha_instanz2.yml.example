@@ -1,0 +1,7 @@
+---
+# Home Assistant instance 2
+homeassistant_api_url: "http://192.168.0.253"
+homeassistant_api_token: "CHANGE_ME"
+
+# Optional:
+# homeassistant_validate_certs: true

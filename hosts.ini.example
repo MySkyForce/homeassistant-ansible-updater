@@ -1,0 +1,8 @@
+[homeassistant]
+ha_instanz1 ansible_host=192.168.0.254
+ha_instanz2 ansible_host=192.168.0.253
+
+[all:vars]
+ansible_user=root
+ansible_ssh_private_key_file=~/.ssh/id_ed25519
+ansible_shell_type=sh
