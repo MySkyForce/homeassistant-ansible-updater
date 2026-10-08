@@ -1,0 +1,461 @@
+---
+# Home Assistant Ansible Updater
+#
+# Updates Home Assistant Core, Supervisor Apps/Add-ons and HACS components.
+# Optional Supervisor and Home Assistant OS updates can be enabled with variables.
+#
+# Required host variables when HACS updates are enabled:
+#   homeassistant_api_url: "http://192.168.0.254"
+#   homeassistant_api_token: "CHANGE_ME"
+#
+# Example:
+#   ansible-playbook -i hosts.ini pb_update_homeassistant.yaml
+
+- name: Update Home Assistant
+  hosts: homeassistant
+  gather_facts: false
+
+  vars:
+    update_core: true
+    update_addons: true
+    update_hacs: true
+
+    # Optional updates
+    update_supervisor: false
+    update_os: false
+
+    # HACS/API settings
+    hacs_post_update_delay: 5
+    homeassistant_validate_certs: true
+
+  pre_tasks:
+    - name: Validate HACS API configuration
+      ansible.builtin.assert:
+        that:
+          - homeassistant_api_url is defined
+          - homeassistant_api_url | length > 0
+          - homeassistant_api_token is defined
+          - homeassistant_api_token | length > 0
+        fail_msg: >-
+          HACS updates are enabled, but homeassistant_api_url or
+          homeassistant_api_token is missing for {{ inventory_hostname }}.
+      when: update_hacs | bool
+      tags:
+        - always
+        - hacs
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Status
+    # -------------------------------------------------------------------------
+
+    - name: Show Home Assistant status
+      ansible.builtin.raw: ha --no-progress info
+      register: ha_info
+      changed_when: false
+      tags:
+        - always
+
+    - name: Print Home Assistant status
+      ansible.builtin.debug:
+        var: ha_info.stdout_lines
+      tags:
+        - always
+
+    # -------------------------------------------------------------------------
+    # Supervisor
+    # -------------------------------------------------------------------------
+
+    - name: Update Home Assistant Supervisor
+      ansible.builtin.raw: ha --no-progress supervisor update
+      register: supervisor_update
+      when: update_supervisor | bool
+      tags:
+        - supervisor
+
+    - name: Print Supervisor update result
+      ansible.builtin.debug:
+        var: supervisor_update.stdout_lines
+      when:
+        - update_supervisor | bool
+        - supervisor_update is defined
+      tags:
+        - supervisor
+
+    # -------------------------------------------------------------------------
+    # Home Assistant Core
+    # -------------------------------------------------------------------------
+
+    - name: Check Home Assistant configuration
+      ansible.builtin.raw: ha --no-progress core check
+      register: core_check
+      changed_when: false
+      when: update_core | bool
+      tags:
+        - core
+
+    - name: Query Home Assistant Core update status
+      ansible.builtin.raw: ha --no-progress core info
+      register: core_info
+      changed_when: false
+      when: update_core | bool
+      tags:
+        - core
+
+    - name: Determine whether a Core update is available
+      ansible.builtin.set_fact:
+        core_update_available: "{{ 'update_available: true' in core_info.stdout }}"
+      when: update_core | bool
+      tags:
+        - core
+
+    - name: Print Core update status
+      ansible.builtin.debug:
+        msg: >-
+          Home Assistant Core:
+          {{ 'update available' if core_update_available else 'already up to date' }}
+      when: update_core | bool
+      tags:
+        - core
+
+    - name: Update Home Assistant Core with backup
+      ansible.builtin.raw: ha --no-progress core update --backup
+      register: core_update
+      when:
+        - update_core | bool
+        - core_check.rc == 0
+        - core_update_available | bool
+      tags:
+        - core
+
+    - name: Print Core update result
+      ansible.builtin.debug:
+        var: core_update.stdout_lines
+      when:
+        - update_core | bool
+        - core_update_available | bool
+        - core_update is defined
+      tags:
+        - core
+
+    # -------------------------------------------------------------------------
+    # Home Assistant Apps / Add-ons
+    # -------------------------------------------------------------------------
+
+    - name: Reload Home Assistant App Store
+      ansible.builtin.raw: ha --no-progress store reload
+      changed_when: false
+      when: update_addons | bool
+      tags:
+        - addons
+
+    - name: Query installed Home Assistant Apps
+      ansible.builtin.raw: ha --raw-json apps list
+      register: ha_apps_raw
+      changed_when: false
+      when: update_addons | bool
+      tags:
+        - addons
+
+    - name: Parse Home Assistant Apps JSON
+      ansible.builtin.set_fact:
+        ha_apps_json: "{{ ha_apps_raw.stdout | from_json }}"
+      when: update_addons | bool
+      tags:
+        - addons
+
+    - name: Extract Supervisor data payload
+      ansible.builtin.set_fact:
+        ha_apps_payload: "{{ ha_apps_json.data | default(ha_apps_json, true) }}"
+      when: update_addons | bool
+      tags:
+        - addons
+
+    - name: Extract installed Apps
+      ansible.builtin.set_fact:
+        ha_apps: >-
+          {{
+            ha_apps_payload.addons
+            | default(ha_apps_payload.apps | default([], true), true)
+          }}
+      when: update_addons | bool
+      tags:
+        - addons
+
+    - name: Print installed Apps
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.name | default(item.slug) }}
+          | installed={{ item.version | default('unknown') }}
+          | latest={{ item.version_latest | default('unknown') }}
+          | update={{ item.update_available | default(false) }}
+      loop: "{{ ha_apps }}"
+      loop_control:
+        label: "{{ item.name | default(item.slug) }}"
+      when: update_addons | bool
+      tags:
+        - addons
+
+    - name: Determine Apps with available updates
+      ansible.builtin.set_fact:
+        ha_apps_updates: >-
+          {{
+            ha_apps
+            | selectattr('update_available', 'defined')
+            | selectattr('update_available', 'equalto', true)
+            | list
+          }}
+      when: update_addons | bool
+      tags:
+        - addons
+
+    - name: Print available App updates
+      ansible.builtin.debug:
+        msg: >-
+          UPDATE: {{ item.name | default(item.slug) }}
+          {{ item.version | default('unknown') }}
+          -> {{ item.version_latest | default('unknown') }}
+          ({{ item.slug }})
+      loop: "{{ ha_apps_updates }}"
+      loop_control:
+        label: "{{ item.name | default(item.slug) }}"
+      when:
+        - update_addons | bool
+        - ha_apps_updates | length > 0
+      tags:
+        - addons
+
+    - name: Update Home Assistant Apps with backup
+      ansible.builtin.raw: >-
+        ha --no-progress apps update {{ item.slug }} --backup
+      register: app_update_result
+      loop: "{{ ha_apps_updates }}"
+      loop_control:
+        label: "{{ item.name | default(item.slug) }} ({{ item.slug }})"
+      when:
+        - update_addons | bool
+        - ha_apps_updates | length > 0
+      tags:
+        - addons
+
+    - name: Report that all Apps are up to date
+      ansible.builtin.debug:
+        msg: "All Home Assistant Apps are already up to date."
+      when:
+        - update_addons | bool
+        - ha_apps_updates | length == 0
+      tags:
+        - addons
+
+    # -------------------------------------------------------------------------
+    # HACS
+    # -------------------------------------------------------------------------
+
+    - name: Query HACS update entities with available updates
+      ansible.builtin.uri:
+        url: "{{ homeassistant_api_url | regex_replace('/+$', '') }}/api/template"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ homeassistant_api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          template: >-
+            {% raw %}
+            {% set ns = namespace(updates=[]) %}
+            {% for entity in integration_entities('hacs')
+               | select('match', '^update\.')
+               | list %}
+              {% if is_state(entity, 'on') %}
+                {% set ns.updates = ns.updates + [{
+                  'entity_id': entity,
+                  'name': state_attr(entity, 'friendly_name') or entity,
+                  'installed_version': state_attr(entity, 'installed_version') or 'unknown',
+                  'latest_version': state_attr(entity, 'latest_version') or 'unknown'
+                }] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.updates | to_json }}
+            {% endraw %}
+        return_content: true
+        status_code: 200
+        timeout: 30
+        validate_certs: "{{ homeassistant_validate_certs }}"
+      register: hacs_updates_raw
+      delegate_to: localhost
+      changed_when: false
+      when: update_hacs | bool
+      tags:
+        - hacs
+
+    - name: Parse available HACS updates
+      ansible.builtin.set_fact:
+        hacs_updates: "{{ hacs_updates_raw.content | trim | from_json }}"
+      when: update_hacs | bool
+      tags:
+        - hacs
+
+    - name: Print available HACS updates
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.name }}:
+          {{ item.installed_version }}
+          -> {{ item.latest_version }}
+          [{{ item.entity_id }}]
+      loop: "{{ hacs_updates }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - update_hacs | bool
+        - hacs_updates | length > 0
+      tags:
+        - hacs
+
+    - name: Install HACS updates
+      ansible.builtin.uri:
+        url: "{{ homeassistant_api_url | regex_replace('/+$', '') }}/api/services/update/install"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ homeassistant_api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          entity_id: "{{ item.entity_id }}"
+        return_content: true
+        status_code: 200
+        timeout: 120
+        validate_certs: "{{ homeassistant_validate_certs }}"
+      register: hacs_update_result
+      loop: "{{ hacs_updates }}"
+      loop_control:
+        label: "{{ item.name }}"
+      delegate_to: localhost
+      when:
+        - update_hacs | bool
+        - hacs_updates | length > 0
+      tags:
+        - hacs
+
+    - name: Report that all HACS components are up to date
+      ansible.builtin.debug:
+        msg: "All HACS components are already up to date."
+      when:
+        - update_hacs | bool
+        - hacs_updates | length == 0
+      tags:
+        - hacs
+
+    # -------------------------------------------------------------------------
+    # Restart Home Assistant only when required after HACS updates
+    # -------------------------------------------------------------------------
+
+    - name: Wait for HACS post-update processing
+      ansible.builtin.pause:
+        seconds: "{{ hacs_post_update_delay }}"
+      when:
+        - update_hacs | bool
+        - hacs_updates | default([]) | length > 0
+      tags:
+        - hacs
+
+    - name: Check whether HACS requires a Home Assistant restart
+      ansible.builtin.uri:
+        url: "{{ homeassistant_api_url | regex_replace('/+$', '') }}/api/template"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ homeassistant_api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          template: >-
+            {% raw %}
+            {% set ns = namespace(restart=[]) %}
+            {% for entity in integration_entities('hacs')
+               | select('match', '^update\.')
+               | list %}
+              {% set summary = state_attr(entity, 'release_summary') or '' %}
+              {% if 'Restart of Home Assistant required' in summary %}
+                {% set ns.restart = ns.restart + [entity] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.restart | to_json }}
+            {% endraw %}
+        return_content: true
+        status_code: 200
+        timeout: 30
+        validate_certs: "{{ homeassistant_validate_certs }}"
+      register: hacs_restart_raw
+      delegate_to: localhost
+      changed_when: false
+      when:
+        - update_hacs | bool
+        - hacs_updates | default([]) | length > 0
+      tags:
+        - hacs
+
+    - name: Parse HACS restart requirements
+      ansible.builtin.set_fact:
+        hacs_restart_required: "{{ hacs_restart_raw.content | trim | from_json }}"
+      when:
+        - update_hacs | bool
+        - hacs_updates | default([]) | length > 0
+      tags:
+        - hacs
+
+    - name: Print Home Assistant restart requirement
+      ansible.builtin.debug:
+        msg: >-
+          Home Assistant restart required by:
+          {{ hacs_restart_required | join(', ') }}
+      when:
+        - hacs_updates | default([]) | length > 0
+        - hacs_restart_required | default([]) | length > 0
+      tags:
+        - hacs
+
+    - name: Restart Home Assistant Core after HACS updates when required
+      ansible.builtin.raw: ha --no-progress core restart
+      register: ha_restart
+      changed_when: true
+      when:
+        - hacs_updates | default([]) | length > 0
+        - hacs_restart_required | default([]) | length > 0
+      tags:
+        - hacs
+
+    # -------------------------------------------------------------------------
+    # Home Assistant OS
+    # -------------------------------------------------------------------------
+
+    - name: Update Home Assistant OS
+      ansible.builtin.raw: ha --no-progress os update
+      register: os_update
+      when: update_os | bool
+      tags:
+        - os
+
+    - name: Print Home Assistant OS update result
+      ansible.builtin.debug:
+        var: os_update.stdout_lines
+      when:
+        - update_os | bool
+        - os_update is defined
+      tags:
+        - os
+
+    # -------------------------------------------------------------------------
+    # Final status
+    # -------------------------------------------------------------------------
+
+    - name: Show final Home Assistant status
+      ansible.builtin.raw: ha --no-progress info
+      register: ha_info_after
+      changed_when: false
+      tags:
+        - always
+
+    - name: Print final Home Assistant status
+      ansible.builtin.debug:
+        var: ha_info_after.stdout_lines
+      tags:
+        - always
